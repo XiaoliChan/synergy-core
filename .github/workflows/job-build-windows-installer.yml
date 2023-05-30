@@ -1,0 +1,106 @@
+name: "Build Windows installer"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-arch64:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    env:
+      GIT_COMMIT: ${{ github.sha }}
+      BONJOUR_BASE_DIR: ${{ github.workspace }}\deps\bonjour
+      QT_BASE_DIR: ${{ github.workspace }}\deps\Qt
+      QT_VERSION: 5.15.2
+      QT_BASE_URL: http://qt.mirror.constant.com/
+      QT_LIB_DIR: ${{ github.workspace }}\deps\Qt\5.15.2
+
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+
+      - name: Cache Qt
+        id: cache-qt
+        uses: actions/cache@v1
+        with:
+          path: ${{ env.QT_BASE_DIR }}
+          key: ${{ runner.os }}-Qt_${{ env.QT_VERSION }}
+
+      - name: Install Qt
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        run: |
+          pip install aqtinstall
+          python -m aqt install --outputdir $env:QT_BASE_DIR --base $env:QT_BASE_URL $env:QT_VERSION windows desktop win64_msvc2019_64
+          cd $env:QT_LIB_DIR\msvc2019_64
+          dir
+
+      - name: Cache Bonjour
+        id: cache-bonjour
+        uses: actions/cache@v1
+        with:
+          path: ${{ env.BONJOUR_BASE_DIR }}
+          key: ${{ runner.os }}-Bonjour
+
+      - name: Install Bonjour SDK
+        if: steps.cache-bonjour.outputs.cache-hit != 'true'
+        run: |
+          New-Item -Force -ItemType Directory -Path "$env:BONJOUR_BASE_DIR"
+          $client = new-object System.Net.WebClient
+          $client.DownloadFile("https://binaries.symless.com/bonjour/BonjourSDK.zip",".\bonjoursdk.zip")
+          [System.IO.Compression.ZipFile]::ExtractToDirectory(".\bonjoursdk.zip", "$env:BONJOUR_BASE_DIR")
+
+      - name: Install dependencies
+        run: |
+          python ./scripts/install_deps.py --skip cmake ninja
+          choco install openssl -y --forcex64 --no-progress
+          Copy-Item -Path "C:\\Program Files\\OpenSSL" -Destination ".\\ext\\openssl\\windows\\x64" -Recurse
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v1.0.2
+
+      - name: Build
+        env:
+          CMAKE_PREFIX_PATH: "${{ env.QT_LIB_DIR }}\\msvc2019_64\\"
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          . ./version
+          msbuild synergy-core.sln /p:Platform="x64" /p:Configuration=Release
+
+      - name: Install wix toolset
+        run: |
+          curl -OLS https://github.com/wixtoolset/wix3/releases/download/wix314rtm/wix314.exe
+          .\wix314.exe /install /quiet /norestart
+    
+      - name: Set wix toolset environment
+        run: |
+          $wixToolsetBinPath = ";C:\Program Files (x86)\WiX Toolset v3.14\bin;"
+          $env:PATH = $env:PATH + $wixToolsetBinPath
+          [Environment]::SetEnvironmentVariable("Path", $env:PATH, [EnvironmentVariableTarget]::Machine)
+          if ((Get-Command "light.exe" -ErrorAction SilentlyContinue) -eq $null)
+          {
+            Write-Host "Unable to find light.exe in your PATH"
+          }else{
+            Write-Host "WIX toolset was in PATH environment"
+          }
+        env:
+            CI: true
+
+      - name: Build installer
+        run: |
+          cd build/installer
+          msbuild Synergy.sln /p:Platform="x64" /p:Configuration=Release /m
+
+      - name: Deliver installer
+        uses: actions/upload-artifact@v2
+        with:
+          name: Synergy-installer
+          path: build\installer\bin\Release\
